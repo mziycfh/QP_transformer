@@ -29,7 +29,9 @@ NUM_VAL_SAMPLES = 10000  # validation samples
 NUM_TEST_SAMPLES = 10000  # test samples
 BATCH_SIZE = 128
 
-KAPPA_LOW = None
+#  Range for the condition number to test robustness (see Section 4.2).
+# If unspecified, generates standard random QPs.
+KAPPA_LOW = None 
 KAPPA_HIGH = None
 
 # Model Architecture Parameters
@@ -86,6 +88,10 @@ class QPDataset(Dataset):
             tag = f"kappa{low_str}-{high_str}"
             dataset_path = f"QP_datasets/{tag}_n{n}_m{m}_s{num_samples}_seed{seed}.pkl"
 
+        # Use absolute path relative to script directory to find datasets
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        dataset_path = os.path.join(script_dir, dataset_path)
+
         if os.path.exists(dataset_path):
             print(f"Loading QP dataset: {dataset_path}")
             self._load_dataset(dataset_path)
@@ -101,6 +107,7 @@ class QPDataset(Dataset):
             self.problems = data["problems"]
             self.solutions = data["solutions"]
             self.x_inits = data["x_inits"]
+            self.lambdas = data.get("lambdas", [torch.zeros(self.m) for _ in range(len(self.solutions))])  # Backward compat
 
     def _save_dataset(self, path: str):
         """Save QP dataset to file"""
@@ -109,6 +116,7 @@ class QPDataset(Dataset):
             "problems": self.problems,
             "solutions": self.solutions,
             "x_inits": self.x_inits,
+            "lambdas": self.lambdas,  # Save lambda values
         }
         with open(path, "wb") as f:
             pickle.dump(data, f)
@@ -122,6 +130,7 @@ class QPDataset(Dataset):
         self.problems = []
         self.solutions = []
         self.x_inits = []
+        self.lambdas = []  # Store Lagrange multipliers
 
         for _ in tqdm(range(self.num_samples), desc="Generating QP problems"):
             while True:
@@ -159,8 +168,8 @@ class QPDataset(Dataset):
                 b = torch.rand(self.m) + 1.0  # Ensure feasible region exists
 
                 try:
-                    # Solve exactly with CVXPY
-                    x_opt = self._solve_general_qp(Q, c, A, b)
+                    # Solve exactly with CVXPY, get both x_opt and lambda_opt
+                    x_opt, lambda_opt = self._solve_general_qp(Q, c, A, b)
 
                     # Find a feasible initial point
                     x_init = self._find_feasible_point(A, b)
@@ -172,14 +181,16 @@ class QPDataset(Dataset):
             self.problems.append((Q, c, A, b))
             self.solutions.append(x_opt)
             self.x_inits.append(x_init)
+            self.lambdas.append(lambda_opt)  # Store lambda
 
-    def _solve_general_qp(self, Q: Tensor, c: Tensor, A: Tensor, b: Tensor) -> Tensor:
-        """Solve general QP exactly"""
+    def _solve_general_qp(self, Q: Tensor, c: Tensor, A: Tensor, b: Tensor) -> Tuple[Tensor, Tensor]:
+        """Solve general QP exactly, return (x_opt, lambda_opt)"""
         import os
         import sys
 
         Q_np, c_np, A_np, b_np = map(lambda t: t.detach().cpu().numpy(), (Q, c, A, b))
         n = Q_np.shape[0]
+        m = A_np.shape[0]
         x = cp.Variable(n)
         obj = 0.5 * cp.quad_form(x, Q_np) + c_np @ x
         constraints = [A_np @ x <= b_np]
@@ -196,7 +207,15 @@ class QPDataset(Dataset):
 
         if prob.status not in ("optimal", "optimal_inaccurate"):
             raise RuntimeError(f"CVXPY status: {prob.status}")
-        return torch.tensor(x.value, dtype=Q.dtype)
+        
+        # Extract dual variables (Lagrange multipliers for constraints)
+        lambda_opt = constraints[0].dual_value
+        if lambda_opt is None:
+            lambda_opt = np.zeros(m)
+        else:
+            lambda_opt = np.asarray(lambda_opt).flatten()
+        
+        return torch.tensor(x.value, dtype=Q.dtype), torch.tensor(lambda_opt, dtype=Q.dtype)
 
     def _find_feasible_point(self, A: Tensor, b: Tensor) -> Tensor:
         """Find a feasible point for the constraint set A x <= b by random sampling"""
@@ -244,6 +263,7 @@ class QPDataset(Dataset):
             "A": A,
             "b": b,
             "solution": x_opt,
+            "lambda": self.lambdas[idx],  # Return Lagrange multiplier
             "problem_id": idx,
         }
 
@@ -553,6 +573,69 @@ class MLP(nn.Module):
         return self.output(x)
 
 
+class LSTMQPModel(nn.Module):
+    """
+    LSTM Baseline for QP problem solving.
+    Processes the QP tokens sequentially.
+    """
+
+    def __init__(
+        self,
+        n: int,
+        m: int,
+        num_layers: int = 4,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n = n
+        self.hidden_dim = hidden_dim
+
+        # Input embedding (Consistent with Transformer)
+        self.token_embedding = nn.Linear(n, hidden_dim)
+
+        self.embedding_norm = nn.LayerNorm(hidden_dim)
+
+        # LSTM Encoder
+        # batch_first=True makes input format (batch, seq_len, feature)
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # Output projection (Consistent with QPTransformer)
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n),
+        )
+
+        self.to(DEVICE)
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        # Embed tokens
+        x = self.token_embedding(tokens)
+        x = self.embedding_norm(x)
+
+        # LSTM processing
+        # output: (batch, seq_len, hidden_dim)
+        # (h_n, c_n): (num_layers, batch, hidden_dim)
+        output, (h_n, c_n) = self.lstm(x)
+
+        # Use the output of the last time step
+        last_token_feature = output[:, -1, :]
+
+        solution = self.output_projection(last_token_feature)
+        return solution
+
+
 # ------------------------------------------------------------
 #  Training and Evaluation Functions
 # ------------------------------------------------------------
@@ -686,6 +769,7 @@ def evaluate_model(model, dataloader: DataLoader) -> dict:
     total_samples = 0
     objective_errors = []
     constraint_violations = []
+    kkt_residuals = []  # Store KKT residuals
 
     # R-squared calculation variables
     ss_res = 0.0  # Sum of squared residuals
@@ -697,11 +781,20 @@ def evaluate_model(model, dataloader: DataLoader) -> dict:
     all_solutions = []
     all_objective_errors = []
     all_constraint_violations = []
+    all_kkt_residuals = []  # Store all KKT residuals for visualization
     all_nmse = []
     all_Q = []
     all_c = []
     all_A = []
     all_b = []
+
+    # For constraint activity analysis
+    active_nmse_list = []
+    active_predictions = []
+    active_solutions = []
+    inactive_nmse_list = []
+    inactive_predictions = []
+    inactive_solutions = []
 
     with torch.no_grad():
         eval_pbar = tqdm(dataloader, desc="Evaluating", leave=False)
@@ -712,6 +805,7 @@ def evaluate_model(model, dataloader: DataLoader) -> dict:
             c = batch["c"].to(DEVICE)
             A = batch["A"].to(DEVICE)
             b = batch["b"].to(DEVICE)
+            lambda_true = batch["lambda"].to(DEVICE)  # Get true Lagrange multipliers
 
             predictions = model(tokens)
 
@@ -741,6 +835,7 @@ def evaluate_model(model, dataloader: DataLoader) -> dict:
                 c_i = c[i].cpu().numpy()
                 A_i = A[i].cpu().numpy()
                 b_i = b[i].cpu().numpy()
+                lambda_i = lambda_true[i].cpu().numpy()  # Get true lambda for this sample
 
                 # Objective function error
                 pred_obj = 0.5 * pred.T @ Q_i @ pred + c_i.T @ pred
@@ -754,6 +849,23 @@ def evaluate_model(model, dataloader: DataLoader) -> dict:
                 constraint_violation_mean = np.mean(violations)
                 constraint_violations.append(constraint_violation_mean)
 
+                # === KKT Residual Calculation ===
+                # 1. Stationarity: ||Qx + c + A^T*lambda||_2
+                grad_L = Q_i @ pred + c_i + A_i.T @ lambda_i
+                stationarity_residual = np.linalg.norm(grad_L, 2)
+                
+                # 2. Primal feasibility: ||max(0, Ax - b)||_2
+                primal_violation = np.maximum(0, Ax - b_i)
+                primal_residual = np.linalg.norm(primal_violation, 2)
+                
+                # 3. Dual feasibility: ||min(0, lambda)||_2
+                dual_violation = np.minimum(0, lambda_i)
+                dual_residual = np.linalg.norm(dual_violation, 2)
+                
+                # Combined KKT residual (sum of three components)
+                kkt_residual = stationarity_residual + primal_residual + dual_residual
+                kkt_residuals.append(kkt_residual)
+
                 # Per-sample NMSE: ||y_i - y_hat_i||^2 / ||y_i||^2
                 residual_norm_squared = np.sum((sol - pred) ** 2)
                 y_norm_squared = np.sum(sol**2)
@@ -763,16 +875,31 @@ def evaluate_model(model, dataloader: DataLoader) -> dict:
                     else 0.0
                 )
 
+                # === Constraint Activity Analysis ===
+                # Check if constraints are active (at least one lambda > 1e-6)
+                constraints_active = np.max(lambda_i) > 1e-6
+
                 # Store for visualization
                 all_predictions.append(pred)
                 all_solutions.append(sol)
                 all_objective_errors.append(obj_error)
                 all_constraint_violations.append(constraint_violation_mean)
+                all_kkt_residuals.append(kkt_residual)  # Store KKT residual
                 all_nmse.append(nmse)
                 all_Q.append(Q_i)
                 all_c.append(c_i)
                 all_A.append(A_i)
                 all_b.append(b_i)
+
+                # Classify by constraint activity
+                if constraints_active:
+                    active_nmse_list.append(nmse)
+                    active_predictions.append(pred)
+                    active_solutions.append(sol)
+                else:
+                    inactive_nmse_list.append(nmse)
+                    inactive_predictions.append(pred)
+                    inactive_solutions.append(sol)
 
             # Update evaluation progress bar
             eval_pbar.set_postfix({"Loss": f"{batch_loss.item():.6f}"})
@@ -790,20 +917,53 @@ def evaluate_model(model, dataloader: DataLoader) -> dict:
     # Calculate R-squared: R^2 = 1 - SS_res / SS_tot
     r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
+    # Calculate R-squared for active constraints
+    active_r_squared = 0.0
+    if len(active_solutions) > 0:
+        active_predictions_arr = np.array(active_predictions)
+        active_solutions_arr = np.array(active_solutions)
+        active_ss_res = np.sum((active_predictions_arr - active_solutions_arr) ** 2)
+        active_y_mean = np.mean(active_solutions_arr, axis=0)
+        active_ss_tot = np.sum((active_solutions_arr - active_y_mean) ** 2)
+        active_r_squared = 1.0 - (active_ss_res / active_ss_tot) if active_ss_tot > 0 else 0.0
+
+    # Calculate R-squared for inactive constraints
+    inactive_r_squared = 0.0
+    if len(inactive_solutions) > 0:
+        inactive_predictions_arr = np.array(inactive_predictions)
+        inactive_solutions_arr = np.array(inactive_solutions)
+        inactive_ss_res = np.sum((inactive_predictions_arr - inactive_solutions_arr) ** 2)
+        inactive_y_mean = np.mean(inactive_solutions_arr, axis=0)
+        inactive_ss_tot = np.sum((inactive_solutions_arr - inactive_y_mean) ** 2)
+        inactive_r_squared = 1.0 - (inactive_ss_res / inactive_ss_tot) if inactive_ss_tot > 0 else 0.0
+
+    # Calculate worst 5% constraint violation indices for analysis
+    all_constraint_violations_arr = np.array(all_constraint_violations)
+    threshold_95 = np.percentile(all_constraint_violations_arr, 95)
+    worst_5pct_indices = np.where(all_constraint_violations_arr >= threshold_95)[0].tolist()
+
     return {
         "mse_loss": total_loss / total_samples,
         "r_squared": r_squared,
         "avg_objective_error": np.mean(objective_errors),
         "avg_constraint_violation": np.mean(constraint_violations),
+        "avg_kkt_residual": np.mean(kkt_residuals),  # Average KKT residual
         "all_predictions": np.array(all_predictions),
         "all_solutions": np.array(all_solutions),
         "all_objective_errors": np.array(all_objective_errors),
         "all_constraint_violations": np.array(all_constraint_violations),
+        "all_kkt_residuals": np.array(all_kkt_residuals),  # All KKT residuals
         "all_nmse": np.array(all_nmse),
         "all_Q": all_Q,
         "all_c": all_c,
         "all_A": all_A,
         "all_b": all_b,
+        "active_r_squared": active_r_squared,
+        "inactive_r_squared": inactive_r_squared,
+        "active_samples": len(active_nmse_list),
+        "inactive_samples": len(inactive_nmse_list),
+        "worst_5pct_indices": worst_5pct_indices,
+        "worst_5pct_threshold": float(threshold_95),
     }
 
 
@@ -814,6 +974,7 @@ def visualize_test_results(evaluation_data: dict, output_folder: str):
     all_solutions = evaluation_data["all_solutions"]
     all_objective_errors = evaluation_data["all_objective_errors"]
     all_constraint_violations = evaluation_data["all_constraint_violations"]
+    all_kkt_residuals = evaluation_data.get("all_kkt_residuals", np.array([]))  # Get KKT residuals
     all_nmse = evaluation_data["all_nmse"]
 
     # 1. NMSE Distribution Histogram
@@ -931,10 +1092,55 @@ def visualize_test_results(evaluation_data: dict, output_folder: str):
     )
     plt.show()
 
+    # 4. KKT Residual Distribution Histogram (if available)
+    if len(all_kkt_residuals) > 0:
+        plt.figure(figsize=(8, 6))
+        plt.hist(
+            all_kkt_residuals,
+            bins=30,
+            alpha=0.7,
+            color="lightyellow",
+            edgecolor="black",
+        )
+        plt.axvline(
+            np.mean(all_kkt_residuals),
+            color="red",
+            linestyle="--",
+            label=f"Mean: {np.mean(all_kkt_residuals):.4f}",
+        )
+        plt.axvline(
+            np.median(all_kkt_residuals),
+            color="blue",
+            linestyle="--",
+            label=f"Median: {np.median(all_kkt_residuals):.4f}",
+        )
+        plt.axvline(
+            np.percentile(all_kkt_residuals, 95),
+            color="orange",
+            linestyle=":",
+            label=f"95th percentile: {np.percentile(all_kkt_residuals, 95):.4f}",
+        )
+        plt.xlabel("KKT Residual", fontweight="bold")
+        plt.ylabel("Frequency", fontweight="bold")
+        plt.title("Distribution of KKT Residuals", fontweight="bold")
+        ax = plt.gca()
+        ax.tick_params(axis="both", labelsize=12)
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontweight("bold")
+        plt.legend(prop={"weight": "bold"}, fontsize=16)
+        plt.grid(True, alpha=0.3)
+        plt.savefig(
+            os.path.join(output_folder, "kkt_residual_distribution.pdf"),
+            bbox_inches="tight",
+        )
+        plt.show()
+
     print(f"\nSaved plots to {output_folder}:")
     print(f"  - nmse_distribution.pdf")
     print(f"  - objective_error_distribution.pdf")
     print(f"  - constraint_violation_distribution.pdf")
+    if len(all_kkt_residuals) > 0:
+        print(f"  - kkt_residual_distribution.pdf")
 
     # Return data for saving to file
     return {
@@ -957,6 +1163,13 @@ def visualize_test_results(evaluation_data: dict, output_folder: str):
         ),
         "zero_violation_samples": np.sum(all_constraint_violations < 1e-6),
         "total_violation_samples": len(all_constraint_violations),
+        "kkt_residual_range": [
+            np.min(all_kkt_residuals),
+            np.max(all_kkt_residuals),
+        ] if len(all_kkt_residuals) > 0 else [0, 0],
+        "kkt_residual_mean": np.mean(all_kkt_residuals) if len(all_kkt_residuals) > 0 else 0,
+        "kkt_residual_median": np.median(all_kkt_residuals) if len(all_kkt_residuals) > 0 else 0,
+        "kkt_residual_95th_percentile": np.percentile(all_kkt_residuals, 95) if len(all_kkt_residuals) > 0 else 0,
     }
 
 
@@ -1050,6 +1263,7 @@ def save_results_to_file(
         f.write(f"R-squared: {results['r_squared']:.6f}\n")
         f.write(f"Objective Error: {results['avg_objective_error']:.6f}\n")
         f.write(f"Constraint Violation: {results['avg_constraint_violation']:.6f}\n")
+        f.write(f"KKT Residual: {results.get('avg_kkt_residual', 0):.6f}\n")
         f.write(
             f"Objective Error Range: [{detailed_results['objective_error_range'][0]:.4f}, {detailed_results['objective_error_range'][1]:.4f}]\n"
         )
@@ -1069,8 +1283,24 @@ def save_results_to_file(
             f"Constraint Violation 95th Percentile: {detailed_results['constraint_violation_95th_percentile']:.4f}\n"
         )
         f.write(
-            f"Samples with Zero Constraint Violation: {detailed_results['zero_violation_samples']}/{detailed_results['total_violation_samples']}\n\n"
+            f"Samples with Zero Constraint Violation: {detailed_results['zero_violation_samples']}/{detailed_results['total_violation_samples']}\n"
         )
+        f.write(
+            f"KKT Residual Range: [{detailed_results['kkt_residual_range'][0]:.4f}, {detailed_results['kkt_residual_range'][1]:.4f}]\n"
+        )
+        f.write(
+            f"KKT Residual Median: {detailed_results['kkt_residual_median']:.4f}\n"
+        )
+        f.write(
+            f"KKT Residual 95th Percentile: {detailed_results['kkt_residual_95th_percentile']:.4f}\n\n"
+        )
+
+        # Constraint Activity Analysis
+        f.write("CONSTRAINT ACTIVITY ANALYSIS\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"Active Constraints R-squared: {results.get('active_r_squared', 0):.6f} (n={results.get('active_samples', 0)})\n")
+        f.write(f"Inactive Constraints R-squared: {results.get('inactive_r_squared', 0):.6f} (n={results.get('inactive_samples', 0)})\n\n")
+
 
         # File Information
         f.write("GENERATED FILES\n")
@@ -1081,6 +1311,7 @@ def save_results_to_file(
         f.write("  - nmse_distribution.pdf\n")
         f.write("  - objective_error_distribution.pdf\n")
         f.write("  - constraint_violation_distribution.pdf\n")
+        f.write("  - kkt_residual_distribution.pdf\n")
         f.write(f"Results: {filepath}\n")
 
     return filepath
@@ -1129,6 +1360,14 @@ def create_model(model_type, args):
             n=args.problem_dim,
             m=args.constraint_num,
             hidden_dim=args.hidden_dim,  # Single hidden_dim parameter
+            dropout=args.dropout,
+        )
+    elif model_type == "LSTM":
+        return LSTMQPModel(
+            n=args.problem_dim,
+            m=args.constraint_num,
+            num_layers=4,  # Hardcode to default value, ignoring args.num_layers
+            hidden_dim=args.hidden_dim,  # Keep hidden_dim from args to match capacity scale
             dropout=args.dropout,
         )
     else:
@@ -1257,6 +1496,7 @@ def parse_args():
             "SoftmaxTransformer",
             "LinearTransformer",
             "MLP",
+            "LSTM",
         ],
         help="Type of model to use (default: SoftmaxTransformer)",
     )
@@ -1392,6 +1632,13 @@ if __name__ == "__main__":
     print("Evaluating model...")
     results = evaluate_model(model, test_loader)
 
+    # Save evaluation results to pickle for later analysis
+    import pickle
+    eval_results_path = os.path.join(output_folder, "evaluation_results.pkl")
+    with open(eval_results_path, "wb") as f:
+        pickle.dump(results, f)
+    print(f"Evaluation results saved to: {eval_results_path}")
+
     # Generate detailed test results visualization
     print("\nGenerating detailed test results visualization...")
     detailed_results = visualize_test_results(results, output_folder)
@@ -1403,6 +1650,7 @@ if __name__ == "__main__":
     print(f"R-squared: {results['r_squared']:.6f}")
     print(f"Average Objective Error: {results['avg_objective_error']:.6f}")
     print(f"Average Constraint Violation: {results['avg_constraint_violation']:.6f}")
+    print(f"Average KKT Residual: {results.get('avg_kkt_residual', 0):.6f}")
 
     # Plot training curves
     plot_training_curves(train_losses, val_losses, output_folder)
